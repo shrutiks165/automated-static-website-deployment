@@ -1,0 +1,63 @@
+name: Deploy Static Website
+
+# Runs automatically every time you push to main
+on:
+  push:
+    branches: [main]
+
+# Lets this workflow request short-lived AWS credentials via OIDC
+# instead of storing long-lived AWS keys as GitHub secrets.
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  TF_WORKING_DIR: terraform
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Exchanges GitHub's OIDC token for temporary AWS credentials.
+      # Requires the IAM OIDC provider + role set up once (see README).
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      - name: Terraform apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve
+
+      # Reads the bucket name straight out of Terraform's own output,
+      # so the workflow never has to hardcode it.
+      - name: Sync website files to S3
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          BUCKET_NAME=$(terraform output -raw s3_bucket_name)
+          aws s3 sync ../website s3://$BUCKET_NAME --delete
+
+      # CloudFront caches files at edge locations. Without this step,
+      # visitors could keep seeing the OLD version for up to an hour
+      # (our default_ttl) after a deploy.
+      - name: Invalidate CloudFront cache
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          DISTRIBUTION_ID=$(terraform output -raw cloudfront_distribution_id)
+          aws cloudfront create-invalidation \
+            --distribution-id $DISTRIBUTION_ID \
+            --paths "/*"
